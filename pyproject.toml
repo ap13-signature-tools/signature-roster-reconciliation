@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signature-roster-reconciliation"
-version = "1.0.0"
+version = "1.1.0"
 description = "Roster vs Orders reconciliation tool for Signature Locker"
 readme = "README.md"
 license = {text = "MIT"}

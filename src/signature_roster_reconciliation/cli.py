@@ -26,7 +26,6 @@ from collections import defaultdict
 from datetime import datetime
 import re
 import unicodedata
-import unicodedata
 
 
 # ============================================================================
@@ -74,22 +73,29 @@ ROSTER_COLUMN_MAPPINGS = {
     ]
 }
 
-# Standard column names in Program Director Report (orders)
-ORDERS_COLUMNS = {
-    'email': 'Order Email',
-    'player_first': "Property 'Player First Name'",
-    'player_last': "Property 'Player Last Name'",
-    'team': "Property 'Selected Team'",
-    'order_number': 'Order number',
-    'order_date': 'DAY Order Date',
-    'billing_first': 'Order Billing First Name',
-    'billing_last': 'Order Billing Last Name',
-    'piece_1_size': 'Piece 1 Size',
-    'piece_2_size': 'Piece 2 Size',
-    'piece_3_size': 'Piece 3 Size',
-    'uniform_number': "Property 'Uniform Number'",
-    'product_name': 'Product name',
-    'category_tag': 'Order Category Tag'
+# Flexible column name mappings for orders data (Program Director Report)
+# Each key maps to a list of possible column names, checked in order
+ORDERS_COLUMN_MAPPINGS = {
+    'email': ['Order Email', 'Email', 'Customer Email'],
+    'player_first': ["Property 'Player First Name'", 'Player First Name'],
+    'player_last': ["Property 'Player Last Name'", 'Player Last Name'],
+    'team': ["Property 'Selected Team'", 'Selected Team', 'Team'],
+    'order_number': ['Order number', 'Order Number', 'Order #'],
+    'order_date': ['DAY Order Date', 'Order Date', 'Date'],
+    'billing_first': ['Order Billing First Name', 'Billing First Name'],
+    'billing_last': ['Order Billing Last Name', 'Billing Last Name'],
+    'uniform_number': ["Property 'Uniform Number'", 'Uniform Number'],
+    'product_name': ['Product name', 'Product Name', 'Product'],
+    'category_tag': ['Order Category Tag', 'Category Tag'],
+    'is_cancelled': ['Order Is cancelled', 'Is Cancelled', 'Cancelled'],
+    'fulfillment_status': ['Fulfillment status', 'Fulfillment Status'],
+}
+
+# Flexible size column mappings - checked in order of preference
+ORDERS_SIZE_COLUMN_MAPPINGS = {
+    'piece_1_size': ['Piece 1 Size', "Property 'Piece1'", "Property 'Piece 1'"],
+    'piece_2_size': ['Piece 2 Size', "Property 'Piece2'", "Property 'Piece 2'"],
+    'piece_3_size': ['Piece 3 Size', "Property 'Piece3'", "Property 'Piece 3'"],
 }
 
 # Patterns that indicate an actual uniform order (vs apparel/accessories)
@@ -579,7 +585,11 @@ def load_orders_data(filepath):
     """
     Load orders data from Program Director Report.
     
-    Returns a standardized DataFrame with order details including sizes.
+    Uses flexible column detection to handle varying Better Reports export formats.
+    Filters out cancelled orders and tracks them separately.
+    Dynamically discovers size/piece columns beyond the standard 3.
+    
+    Returns a tuple: (orders_df, cancelled_orders_df)
     """
     print(f"\n{'='*60}")
     print("LOADING ORDERS DATA")
@@ -587,75 +597,178 @@ def load_orders_data(filepath):
     
     xls = pd.ExcelFile(filepath)
     df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
-    print(f"Loaded {len(df)} orders from '{xls.sheet_names[0]}'")
+    print(f"Loaded {len(df)} rows from '{xls.sheet_names[0]}'")
     
+    # --- Flexible column detection ---
+    def find_order_column(possible_names):
+        """Find the first matching column name from a list of possibilities."""
+        for col_name in possible_names:
+            if col_name in df.columns:
+                return col_name
+            # Case-insensitive fallback
+            for actual_col in df.columns:
+                if str(actual_col).lower().strip() == col_name.lower().strip():
+                    return actual_col
+        return None
+    
+    # Map each field to the actual column found
+    col_map = {}
+    for field, possible_names in ORDERS_COLUMN_MAPPINGS.items():
+        found = find_order_column(possible_names)
+        if found:
+            col_map[field] = found
+            print(f"  Mapped '{found}' -> '{field}'")
+        elif field in ('email', 'player_first', 'player_last'):
+            print(f"  WARNING: Required column '{field}' not found! Tried: {possible_names}")
+    
+    # --- Filter cancelled orders ---
+    cancelled_orders_df = pd.DataFrame()
+    cancel_col = col_map.get('is_cancelled')
+    if cancel_col:
+        # Detect cancelled rows (handle True, 'true', 'True', 'yes', etc.)
+        cancel_mask = df[cancel_col].apply(
+            lambda x: str(x).strip().lower() in ('true', 'yes', '1') if pd.notna(x) else False
+        )
+        cancelled_rows = df[cancel_mask].copy()
+        if len(cancelled_rows) > 0:
+            print(f"  Found {len(cancelled_rows)} cancelled orders (will be excluded)")
+            # Build a clean cancelled orders dataframe for reporting
+            cancelled_orders_df = pd.DataFrame()
+            cancelled_orders_df['order_number'] = cancelled_rows.get(col_map.get('order_number'))
+            cancelled_orders_df['order_date'] = cancelled_rows.get(col_map.get('order_date'))
+            cancelled_orders_df['order_email'] = cancelled_rows.get(col_map.get('email'))
+            pfn = col_map.get('player_first')
+            pln = col_map.get('player_last')
+            cancelled_orders_df['player_first'] = cancelled_rows[pfn] if pfn else None
+            cancelled_orders_df['player_last'] = cancelled_rows[pln] if pln else None
+            cancelled_orders_df['team'] = cancelled_rows.get(col_map.get('team'))
+            cancelled_orders_df['product_name'] = cancelled_rows.get(col_map.get('product_name'))
+            cancelled_orders_df = cancelled_orders_df.reset_index(drop=True)
+            df = df[~cancel_mask].copy()
+        else:
+            print(f"  Cancellation column found, no cancelled orders")
+    else:
+        print(f"  No cancellation column found in orders data")
+    
+    # --- Build standardized orders dataframe ---
     orders = pd.DataFrame()
     
-    # Map standard order columns
-    orders['order_number'] = df.get(ORDERS_COLUMNS['order_number'])
-    orders['order_date'] = df.get(ORDERS_COLUMNS['order_date'])
-    orders['order_email'] = df.get(ORDERS_COLUMNS['email']).apply(normalize_email)
-    orders['order_email_original'] = df.get(ORDERS_COLUMNS['email'])
+    orders['order_number'] = df.get(col_map.get('order_number'))
+    orders['order_date'] = df.get(col_map.get('order_date'))
     
-    # Player name from order
-    orders['player_first'] = df.get(ORDERS_COLUMNS['player_first']).apply(
-        lambda x: normalize_name(x) if pd.notna(x) else None
-    )
-    orders['player_last'] = df.get(ORDERS_COLUMNS['player_last']).apply(
-        lambda x: normalize_name(x) if pd.notna(x) else None
-    )
-    orders['player_first_original'] = df.get(ORDERS_COLUMNS['player_first'])
-    orders['player_last_original'] = df.get(ORDERS_COLUMNS['player_last'])
+    email_col = col_map.get('email')
+    if email_col:
+        orders['order_email'] = df[email_col].apply(normalize_email)
+        orders['order_email_original'] = df[email_col]
+    
+    # Player name from order - use pd.notna() to prevent NaN truthiness bug
+    first_col = col_map.get('player_first')
+    last_col = col_map.get('player_last')
+    
+    if first_col:
+        orders['player_first'] = df[first_col].apply(
+            lambda x: normalize_name(x) if pd.notna(x) else None
+        )
+        orders['player_first_original'] = df[first_col]
+    else:
+        orders['player_first'] = None
+        orders['player_first_original'] = None
+    
+    if last_col:
+        orders['player_last'] = df[last_col].apply(
+            lambda x: normalize_name(x) if pd.notna(x) else None
+        )
+        orders['player_last_original'] = df[last_col]
+    else:
+        orders['player_last'] = None
+        orders['player_last_original'] = None
+    
+    # Combine into full name - use pd.notna() instead of truthiness check
     orders['player_name'] = orders.apply(
         lambda row: f"{row['player_first']} {row['player_last']}".strip() 
-        if row['player_first'] and row['player_last'] else None,
+        if pd.notna(row['player_first']) and pd.notna(row['player_last']) 
+        and row['player_first'] is not None and row['player_last'] is not None
+        else None,
         axis=1
     )
     
-    # Team from order
-    orders['order_team'] = df.get(ORDERS_COLUMNS['team'])
+    # Team from order - strip whitespace from raw value
+    team_col = col_map.get('team')
+    if team_col:
+        orders['order_team'] = df[team_col].apply(
+            lambda x: str(x).strip() if pd.notna(x) else None
+        )
+    else:
+        orders['order_team'] = None
     orders['order_team_normalized'] = orders['order_team'].apply(
         lambda x: normalize_name(x) if pd.notna(x) else None
     )
     
     # Billing info
-    orders['billing_first'] = df.get(ORDERS_COLUMNS['billing_first'])
-    orders['billing_last'] = df.get(ORDERS_COLUMNS['billing_last'])
+    billing_first_col = col_map.get('billing_first')
+    billing_last_col = col_map.get('billing_last')
+    orders['billing_first'] = df[billing_first_col] if billing_first_col else None
+    orders['billing_last'] = df[billing_last_col] if billing_last_col else None
     
-    # Size columns
-    orders['piece_1_size'] = df.get(ORDERS_COLUMNS['piece_1_size'])
-    orders['piece_2_size'] = df.get(ORDERS_COLUMNS['piece_2_size'])
-    orders['piece_3_size'] = df.get(ORDERS_COLUMNS['piece_3_size'])
+    # --- Size columns: standard mapped pieces ---
+    size_col_map = {}
+    for field, possible_names in ORDERS_SIZE_COLUMN_MAPPINGS.items():
+        found = find_order_column(possible_names)
+        if found:
+            size_col_map[field] = found
+            print(f"  Mapped '{found}' -> '{field}'")
+    
+    for field in ['piece_1_size', 'piece_2_size', 'piece_3_size']:
+        actual_col = size_col_map.get(field)
+        if actual_col:
+            orders[field] = df[actual_col]
+        else:
+            orders[field] = None
     
     # Normalized sizes for comparison
-    orders['piece_1_size_normalized'] = orders['piece_1_size'].apply(
-        lambda x: str(x).lower().strip() if pd.notna(x) else None
-    )
-    orders['piece_2_size_normalized'] = orders['piece_2_size'].apply(
-        lambda x: str(x).lower().strip() if pd.notna(x) else None
-    )
-    orders['piece_3_size_normalized'] = orders['piece_3_size'].apply(
-        lambda x: str(x).lower().strip() if pd.notna(x) else None
-    )
+    for field in ['piece_1_size', 'piece_2_size', 'piece_3_size']:
+        orders[f'{field}_normalized'] = orders[field].apply(
+            lambda x: str(x).lower().strip() if pd.notna(x) else None
+        )
+    
+    # --- Dynamic extra piece/hat columns ---
+    # Detect any additional Property 'Piece...' or hat columns not already mapped
+    extra_size_cols = []
+    mapped_cols = set(size_col_map.values())
+    for col in df.columns:
+        col_str = str(col)
+        # Match Property 'PieceN', Property 'SomeText Hat', etc.
+        is_piece = (col_str.startswith("Property '") and 
+                    ('piece' in col_str.lower() or 'hat' in col_str.lower()) and
+                    col not in mapped_cols)
+        if is_piece:
+            clean_name = col_str.replace("Property '", "").rstrip("'").strip()
+            field_name = f'extra_size_{clean_name.lower().replace(" ", "_")}'
+            orders[field_name] = df[col]
+            extra_size_cols.append(field_name)
+            print(f"  Discovered extra size column: '{col}' -> '{field_name}'")
+    
+    orders['_extra_size_cols'] = None  # Placeholder; we'll store the list as metadata
     
     # Uniform number from order
-    uniform_num_col = df.get(ORDERS_COLUMNS['uniform_number'])
-    if uniform_num_col is not None:
-        orders['order_uniform_number'] = uniform_num_col.apply(
+    uniform_col = col_map.get('uniform_number')
+    if uniform_col:
+        orders['order_uniform_number'] = df[uniform_col].apply(
             lambda x: str(int(x)) if pd.notna(x) and str(x).replace('.0','').replace('-','').isdigit() 
             else (str(x).strip() if pd.notna(x) else None)
         )
-        orders['order_uniform_number_original'] = uniform_num_col
+        orders['order_uniform_number_original'] = df[uniform_col]
     else:
         orders['order_uniform_number'] = None
         orders['order_uniform_number_original'] = None
     
     # Product name and uniform order detection
-    orders['product_name'] = df.get(ORDERS_COLUMNS['product_name'])
-    orders['category_tag'] = df.get(ORDERS_COLUMNS['category_tag'])
+    product_col = col_map.get('product_name')
+    category_col = col_map.get('category_tag')
+    orders['product_name'] = df[product_col] if product_col else None
+    orders['category_tag'] = df[category_col] if category_col else None
     
     # Determine if this is an actual uniform order (vs apparel/accessories)
-    # Check if product name contains any of the uniform patterns
     def is_uniform_order(product_name):
         if pd.isna(product_name):
             return False
@@ -664,6 +777,7 @@ def load_orders_data(filepath):
     
     orders['is_uniform_order'] = orders['product_name'].apply(is_uniform_order)
     
+    # Drop rows missing required fields (email AND player name)
     orders = orders.dropna(subset=['order_email', 'player_name']).reset_index(drop=True)
     
     uniform_count = orders['is_uniform_order'].sum()
@@ -671,7 +785,10 @@ def load_orders_data(filepath):
     print(f"Processed {len(orders)} valid orders ({uniform_count} uniforms, {apparel_count} apparel/accessories)")
     print(f"Unique teams: {orders['order_team'].nunique()}")
     
-    return orders
+    # Store extra size column names as metadata on the dataframe
+    orders.attrs['extra_size_cols'] = extra_size_cols
+    
+    return orders, cancelled_orders_df
 
 
 # ============================================================================
@@ -859,6 +976,10 @@ def find_wrong_team(roster, orders, email_matches, name_matches):
     Uses intelligent team name matching that handles common variations:
     - "2027 Elite" vs "2027 Elite CLT" -> treated as same team
     - Different teams with similar names are properly distinguished
+    
+    Only flags when the ORDER's player name matches the ROSTER player name.
+    This prevents false positives from sibling orders (different kids on
+    different teams sharing a parent email).
     """
     wrong_team = []
     
@@ -866,6 +987,9 @@ def find_wrong_team(roster, orders, email_matches, name_matches):
         roster_team = row.get('team_name')
         if not roster_team:
             continue
+        
+        roster_first = normalize_name(row.get('player_first'))
+        roster_last = normalize_last_name(row.get('player_last'))
         
         # Get all order indices for this roster entry
         email_order_matches = email_matches.get(idx, [])
@@ -877,7 +1001,27 @@ def find_wrong_team(roster, orders, email_matches, name_matches):
             o_row = orders.loc[o_idx]
             order_team = o_row.get('order_team')
             
-            if order_team and roster_team:
+            # Skip orders with no team
+            if not order_team or pd.isna(order_team):
+                continue
+            
+            # Verify the order's player name matches this roster player.
+            # If names don't match, this is a sibling's order and a team
+            # difference is expected, not an error.
+            order_first = normalize_name(o_row.get('player_first'))
+            order_last = normalize_last_name(o_row.get('player_last'))
+            
+            first_name_match = (
+                roster_first == order_first or 
+                (roster_first and order_first and similarity_score(roster_first, order_first) >= 0.85)
+            )
+            last_name_match = roster_last == order_last
+            
+            if not (first_name_match and last_name_match):
+                # This order belongs to a different person (sibling), skip
+                continue
+            
+            if roster_team and order_team:
                 # Use the intelligent team comparison
                 team_similarity = calculate_team_similarity(roster_team, order_team)
                 
@@ -1427,11 +1571,12 @@ def generate_data_quality_warnings(roster, orders, has_uniform_numbers):
 # REPORTING FUNCTIONS
 # ============================================================================
 
-def generate_summary(roster, orders, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings):
+def generate_summary(roster, orders, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, cancelled_orders):
     """Generate summary statistics."""
     summary = {
         'Total Roster Entries': len(roster),
         'Total Orders Received': len(orders),
+        'Cancelled Orders Excluded': len(cancelled_orders),
         'Unique Teams (Roster)': roster['team_name'].nunique(),
         'Unique Teams (Orders)': orders['order_team'].nunique(),
         'Players Not Ordered': len(not_ordered),
@@ -1456,7 +1601,7 @@ def generate_summary(roster, orders, not_ordered, true_duplicates, sibling_order
     return summary
 
 
-def save_report(output_path, summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, team_size_stats, roster, orders):
+def save_report(output_path, summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, team_size_stats, roster, orders, cancelled_orders):
     """Save reconciliation report to Excel file."""
     print(f"\n{'='*60}")
     print("SAVING REPORT")
@@ -1519,6 +1664,8 @@ def save_report(output_path, summary, not_ordered, true_duplicates, sibling_orde
         issues.append(('Uniform Number Mismatches', len(uniform_mismatches), error_fill if len(uniform_mismatches) > 0 else success_fill))
     else:
         issues.append(('Uniform Number Check', 'N/A - No uniform numbers in roster', info_fill))
+    
+    issues.append(('Cancelled Orders Excluded', len(cancelled_orders), warning_fill if len(cancelled_orders) > 0 else info_fill))
     
     for issue_name, count, fill in issues:
         ws_summary[f'A{row}'] = issue_name
@@ -1932,12 +2079,52 @@ def save_report(output_path, summary, not_ordered, true_duplicates, sibling_orde
     ws_orders_data.column_dimensions['H'].width = 55
     ws_orders_data.column_dimensions['I'].width = 15
     
+    # -------------------------------------------------------------------------
+    # Cancelled Orders Sheet (Informational)
+    # -------------------------------------------------------------------------
+    ws_cancelled = wb.create_sheet("Cancelled Orders")
+    
+    ws_cancelled.cell(row=1, column=1, value="Orders identified as cancelled and excluded from the reconciliation analysis.")
+    ws_cancelled.cell(row=1, column=1).font = Font(italic=True, color='666666')
+    ws_cancelled.merge_cells('A1:G1')
+    
+    cancelled_headers = ['Order Number', 'Order Date', 'Order Email', 'Player First Name', 'Player Last Name', 'Team', 'Product Name']
+    for col, header in enumerate(cancelled_headers, 1):
+        cell = ws_cancelled.cell(row=2, column=col, value=header)
+        cell.font = header_font
+        cell.fill = PatternFill('solid', fgColor='A6A6A6')  # Grey for cancelled
+        cell.border = thin_border
+    
+    if len(cancelled_orders) > 0:
+        for row_idx, (idx, row) in enumerate(cancelled_orders.iterrows(), 3):
+            ws_cancelled.cell(row=row_idx, column=1, value=row.get('order_number'))
+            ws_cancelled.cell(row=row_idx, column=2, value=str(row.get('order_date'))[:10] if pd.notna(row.get('order_date')) else '')
+            ws_cancelled.cell(row=row_idx, column=3, value=row.get('order_email'))
+            ws_cancelled.cell(row=row_idx, column=4, value=row.get('player_first'))
+            ws_cancelled.cell(row=row_idx, column=5, value=row.get('player_last'))
+            ws_cancelled.cell(row=row_idx, column=6, value=row.get('team'))
+            ws_cancelled.cell(row=row_idx, column=7, value=row.get('product_name'))
+            # Strikethrough styling for cancelled orders
+            for c in range(1, 8):
+                ws_cancelled.cell(row=row_idx, column=c).font = Font(strikethrough=True, color='999999')
+    else:
+        ws_cancelled.cell(row=3, column=1, value="No cancelled orders were found in the data.")
+        ws_cancelled.cell(row=3, column=1).font = Font(color='006400')
+    
+    ws_cancelled.column_dimensions['A'].width = 14
+    ws_cancelled.column_dimensions['B'].width = 14
+    ws_cancelled.column_dimensions['C'].width = 30
+    ws_cancelled.column_dimensions['D'].width = 20
+    ws_cancelled.column_dimensions['E'].width = 20
+    ws_cancelled.column_dimensions['F'].width = 35
+    ws_cancelled.column_dimensions['G'].width = 55
+    
     # Save
     wb.save(output_path)
     print(f"Report saved to: {output_path}")
 
 
-def print_console_summary(summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings):
+def print_console_summary(summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, cancelled_orders):
     """Print summary to console."""
     print(f"\n{'='*60}")
     print("RECONCILIATION SUMMARY")
@@ -1971,8 +2158,10 @@ def print_console_summary(summary, not_ordered, true_duplicates, sibling_orders,
     if wrong_team:
         print(f"\n--- Wrong Team ({len(wrong_team)}) ---")
         for item in wrong_team[:10]:
-            roster_team = item['roster_team'][:35] if len(item['roster_team']) > 35 else item['roster_team']
-            order_team = item['order_team'][:35] if len(item['order_team']) > 35 else item['order_team']
+            roster_team = str(item.get('roster_team', '') or '')
+            order_team = str(item.get('order_team', '') or '')
+            roster_team = roster_team[:35] if len(roster_team) > 35 else roster_team
+            order_team = order_team[:35] if len(order_team) > 35 else order_team
             print(f"  - {item['player_name']}: Roster={roster_team}... Order={order_team}...")
         if len(wrong_team) > 10:
             print(f"  ... and {len(wrong_team) - 10} more")
@@ -2027,6 +2216,17 @@ def print_console_summary(summary, not_ordered, true_duplicates, sibling_orders,
     else:
         print(f"\n--- Data Quality Warnings ---")
         print(f"  No warnings detected!")
+    
+    if len(cancelled_orders) > 0:
+        print(f"\n--- Cancelled Orders ({len(cancelled_orders)}) ---")
+        for idx, row in cancelled_orders.head(10).iterrows():
+            player = f"{row.get('player_first', '')} {row.get('player_last', '')}".strip() or 'N/A'
+            print(f"  - Order #{row.get('order_number')}: {player} ({row.get('team', 'N/A')})")
+        if len(cancelled_orders) > 10:
+            print(f"  ... and {len(cancelled_orders) - 10} more")
+    else:
+        print(f"\n--- Cancelled Orders (0) ---")
+        print(f"  No cancelled orders found")
 
 
 # ============================================================================
@@ -2069,7 +2269,7 @@ Examples:
     
     # Load data
     roster, has_uniform_numbers = load_roster_data(args.roster_file, args.roster_sheet)
-    orders = load_orders_data(args.orders_file)
+    orders, cancelled_orders = load_orders_data(args.orders_file)
     
     # Perform matching
     print(f"\n{'='*60}")
@@ -2107,11 +2307,11 @@ Examples:
     data_quality_warnings = generate_data_quality_warnings(roster, orders, has_uniform_numbers)
     
     # Generate summary
-    summary = generate_summary(roster, orders, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings)
+    summary = generate_summary(roster, orders, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, cancelled_orders)
     
     # Output
-    print_console_summary(summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings)
-    save_report(args.output, summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, team_size_stats, roster, orders)
+    print_console_summary(summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, cancelled_orders)
+    save_report(args.output, summary, not_ordered, true_duplicates, sibling_orders, wrong_team, misspellings, size_outliers, uniform_mismatches, uniform_check_performed, data_quality_warnings, team_size_stats, roster, orders, cancelled_orders)
     
     print(f"\n{'='*60}")
     print("RECONCILIATION COMPLETE")
